@@ -494,10 +494,11 @@ const ROTATING_TIPS: [&str; 19] = [
 
 const GREETING_BREAK_POINT: usize = 80;
 
-const POPULAR_SHORTCUTS: &str = color_print::cstr! {"<black!><green!>/help</green!> all commands  <em>•</em>  <green!>ctrl + j</green!> new lines  <em>•</em>  <green!>ctrl + s</green!> fuzzy search</black!>"};
+const POPULAR_SHORTCUTS: &str = color_print::cstr! {"<black!><green!>/help</green!> all commands  <em>•</em>  <green!>ctrl + j</green!> new lines  <em>•</em>  <green!>ctrl + s</green!> fuzzy search  <em>•</em>  <green!>ctrl + v</green!> prompts</black!>"};
 const SMALL_SCREEN_POPULAR_SHORTCUTS: &str = color_print::cstr! {"<black!><green!>/help</green!> all commands
 <green!>ctrl + j</green!> new lines
 <green!>ctrl + s</green!> fuzzy search
+<green!>ctrl + v</green!> prompts
 </black!>"};
 
 const RESPONSE_TIMEOUT_CONTENT: &str = "Response timed out - message took too long to generate";
@@ -1913,6 +1914,12 @@ impl ChatSession {
                 .collect::<Vec<_>>();
             self.input_source
                 .put_skim_command_selector(os, Arc::new(context_manager.clone()), tool_names);
+        }
+
+        // Setup Ctrl+V for interactive prompt selector (uses same channels as Tab completion)
+        #[cfg(unix)]
+        {
+            self.input_source.put_skim_prompt_selector(os);
         }
 
         execute!(

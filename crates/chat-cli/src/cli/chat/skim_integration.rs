@@ -4,6 +4,7 @@ use std::io::{
     Write,
     stdout,
 };
+use std::sync::{Arc, Mutex};
 
 use crossterm::execute;
 use crossterm::terminal::{
@@ -24,7 +25,16 @@ use skim::prelude::*;
 use tempfile::NamedTempFile;
 
 use super::context::ContextManager;
+use super::util::truncate_safe_in_place;
 use crate::os::Os;
+
+// Column width constants for prompt selector skim display
+const PROMPT_SELECTOR_SERVER_WIDTH: usize = 15;
+const PROMPT_SELECTOR_PROMPT_WIDTH: usize = 15;
+const PROMPT_SELECTOR_DESC_WIDTH: usize = 25;
+
+// Truncation suffix for display text that exceeds column width
+const TRUNCATED_SUFFIX: &str = "...";
 
 pub struct SkimCommandSelector {
     os: Os,
@@ -56,6 +66,29 @@ impl ConditionalEventHandler for SkimCommandSelector {
     }
 }
 
+pub struct PromptSelector {
+    sender: super::prompt::PromptQuerySender,
+    receiver: Arc<Mutex<super::prompt::PromptQueryResponseReceiver>>,
+}
+
+impl PromptSelector {
+    pub fn new(sender: super::prompt::PromptQuerySender, receiver: super::prompt::PromptQueryResponseReceiver) -> Self {
+        Self { 
+            sender,
+            receiver: Arc::new(Mutex::new(receiver)),
+        }
+    }
+}
+
+impl ConditionalEventHandler for PromptSelector {
+    fn handle(&self, _evt: &rustyline::Event, _n: RepeatCount, _positive: bool, _ctx: &EventContext<'_>) -> Option<Cmd> {
+        match select_prompt_with_skim(&self.sender, &self.receiver) {
+            Ok(Some(prompt)) => Some(Cmd::Insert(1, prompt)),
+            _ => Some(Cmd::Noop), // Error or cancelled
+        }
+    }
+}
+
 pub fn get_available_commands() -> Vec<String> {
     // Import the COMMANDS array directly from prompt.rs
     // This is the single source of truth for available commands
@@ -67,6 +100,95 @@ pub fn get_available_commands() -> Vec<String> {
     }
 
     commands
+}
+
+/// Get available prompts with server grouping and sorting
+pub fn get_available_prompts(
+    sender: &super::prompt::PromptQuerySender, 
+    receiver: &Arc<Mutex<super::prompt::PromptQueryResponseReceiver>>
+) -> Result<Vec<(String, String, String, String)>> {
+    let prompts = fetch_prompts_from_servers(sender, receiver)?;
+    if prompts.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    let grouped_prompts = group_and_sort_prompts(prompts);
+    Ok(format_prompts_for_display(grouped_prompts))
+}
+
+/// Fetch prompts using existing query mechanism
+fn fetch_prompts_from_servers(
+    sender: &super::prompt::PromptQuerySender,
+    receiver: &Arc<Mutex<super::prompt::PromptQueryResponseReceiver>>
+) -> Result<std::collections::HashMap<String, Vec<super::tool_manager::PromptBundle>>> {
+    use super::tool_manager::{PromptQuery, PromptQueryResult};
+    
+    // Send query using same pattern as Tab completion
+    sender.send(PromptQuery::List).map_err(|e| eyre!("Failed to send query: {}", e))?;
+    
+    let mut new_receiver = {
+        let receiver_guard = receiver.lock().map_err(|e| eyre!("Failed to lock receiver: {}", e))?;
+        receiver_guard.resubscribe()
+    };
+    
+    // Use shared polling logic from prompt.rs
+    let query_res = super::prompt::PromptCompleter::poll_for_query_result(&mut new_receiver)
+        .map_err(|e| eyre!("Polling failed: {}", e))?;
+    
+    match query_res {
+        PromptQueryResult::List(list) => Ok(list),
+        PromptQueryResult::Search(_) => Err(eyre!("Wrong query response type received")),
+    }
+}
+
+/// Group prompts by server and sort both servers and prompts alphabetically
+fn group_and_sort_prompts(
+    prompts: std::collections::HashMap<String, Vec<super::tool_manager::PromptBundle>>
+) -> Vec<(String, Vec<(String, super::tool_manager::PromptBundle)>)> {
+    // Group by server
+    let mut servers_with_prompts: std::collections::HashMap<String, Vec<(String, super::tool_manager::PromptBundle)>> = std::collections::HashMap::new();
+    
+    for (prompt_name, bundles) in prompts {
+        for bundle in bundles {
+            servers_with_prompts
+                .entry(bundle.server_name.clone())
+                .or_insert_with(Vec::new)
+                .push((prompt_name.clone(), bundle));
+        }
+    }
+    
+    // Convert to Vec and sort servers alphabetically
+    let mut servers_with_prompts: Vec<_> = servers_with_prompts.into_iter().collect();
+    servers_with_prompts.sort_by(|a, b| a.0.cmp(&b.0));
+    
+    // Sort prompts alphabetically within each server
+    for (_, prompts_in_server) in &mut servers_with_prompts {
+        prompts_in_server.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    
+    servers_with_prompts
+}
+
+/// Format grouped prompts for display: (prompt_name, server, description, args)
+fn format_prompts_for_display(
+    servers_with_prompts: Vec<(String, Vec<(String, super::tool_manager::PromptBundle)>)>
+) -> Vec<(String, String, String, String)> {
+    servers_with_prompts
+        .iter()
+        .flat_map(|(_, prompts_in_server)| {
+            prompts_in_server.iter().map(|(prompt_name, bundle)| {
+                let description = bundle.prompt_get.description.as_deref().unwrap_or("No description");
+                let args = bundle.format_arguments_for_display();
+                
+                (
+                    format!("@{}", prompt_name),
+                    bundle.server_name.clone(),
+                    description.to_string(),
+                    args
+                )
+            })
+        })
+        .collect()
 }
 
 /// Format commands for skim display
@@ -289,6 +411,73 @@ pub fn select_command(_os: &Os, context_manager: &ContextManager, tools: &[Strin
     }
 }
 
+/// Select a prompt using skim interface
+pub fn select_prompt_with_skim(
+    sender: &super::prompt::PromptQuerySender, 
+    receiver: &Arc<Mutex<super::prompt::PromptQueryResponseReceiver>>
+) -> Result<Option<String>> {
+    // Get formatted prompts using the extracted function
+    let formatted_prompts = get_available_prompts(sender, receiver)?;
+    
+    if formatted_prompts.is_empty() {
+        return Ok(None);
+    }
+
+    // Create display lines with truncation
+    let display_lines: Vec<String> = formatted_prompts
+        .iter()
+        .map(|(prompt_name, server, description, args)| {
+            let mut truncated_desc = description.clone();
+            truncate_safe_in_place(&mut truncated_desc, PROMPT_SELECTOR_DESC_WIDTH, TRUNCATED_SUFFIX);
+            
+            let mut truncated_server = server.clone();
+            truncate_safe_in_place(&mut truncated_server, PROMPT_SELECTOR_SERVER_WIDTH, TRUNCATED_SUFFIX);
+            
+            // Arguments get remaining space (no truncation)
+            format!("{:<prompt_width$} {:<server_width$} {:<desc_width$} {}", 
+                prompt_name, truncated_server, truncated_desc, args,
+                prompt_width = PROMPT_SELECTOR_PROMPT_WIDTH,
+                server_width = PROMPT_SELECTOR_SERVER_WIDTH,
+                desc_width = PROMPT_SELECTOR_DESC_WIDTH)
+        })
+        .collect();
+
+    // Create prompt mapping for selection
+    let prompt_map: std::collections::HashMap<String, String> = display_lines
+        .iter()
+        .zip(formatted_prompts.iter().map(|(prompt_name, _, _, _)| prompt_name.clone()))
+        .map(|(line, prompt)| (line.clone(), prompt))
+        .collect();
+
+    // Create skim options with proper header alignment
+    let header = format!("{:<prompt_width$} {:<server_width$} {:<desc_width$} {}",
+        "Prompt", "Server", "Description", "Arguments (* = required)",
+        prompt_width = PROMPT_SELECTOR_PROMPT_WIDTH,
+        server_width = PROMPT_SELECTOR_SERVER_WIDTH,
+        desc_width = PROMPT_SELECTOR_DESC_WIDTH);
+    
+    let options = SkimOptionsBuilder::default()
+        .height("100%".to_string())
+        .prompt("Select prompt: ".to_string())
+        .reverse(true)
+        .multi(false)
+        .header(Some(header))
+        .build()
+        .map_err(|e| eyre!("Failed to build skim options: {}", e))?;
+
+    let item_reader = SkimItemReader::default();
+    let items = item_reader.of_bufread(Cursor::new(display_lines.join("\n")));
+
+    // Use existing helper for consistency
+    match run_skim_with_options(&options, items)? {
+        Some(items) if !items.is_empty() => {
+            let selection = items[0].output().to_string();
+            Ok(prompt_map.get(&selection).cloned())
+        },
+        _ => Ok(None),
+    }
+}
+
 #[derive(PartialEq)]
 enum CommandType {
     ContextAdd(String),
@@ -362,5 +551,107 @@ mod tests {
                 cmd
             );
         }
+    }
+
+    #[test]
+    fn test_format_prompt_arguments() {
+        use super::super::tool_manager::PromptBundle;
+        use amzn_mcp_client::types::{Prompt, PromptArgument};
+
+        // Test with no arguments
+        let bundle_no_args = PromptBundle {
+            server_name: "test".to_string(),
+            prompt_get: Prompt {
+                name: "test".to_string(),
+                description: Some("test".to_string()),
+                arguments: None,
+            },
+        };
+        assert_eq!(bundle_no_args.format_arguments_for_display(), "");
+
+        // Test with empty arguments
+        let bundle_empty_args = PromptBundle {
+            server_name: "test".to_string(),
+            prompt_get: Prompt {
+                name: "test".to_string(),
+                description: Some("test".to_string()),
+                arguments: Some(vec![]),
+            },
+        };
+        assert_eq!(bundle_empty_args.format_arguments_for_display(), "");
+
+        // Test with mixed required and optional arguments
+        let bundle_mixed_args = PromptBundle {
+            server_name: "test".to_string(),
+            prompt_get: Prompt {
+                name: "test".to_string(),
+                description: Some("test".to_string()),
+                arguments: Some(vec![
+                    PromptArgument {
+                        name: "required_arg".to_string(),
+                        description: Some("A required argument".to_string()),
+                        required: Some(true),
+                    },
+                    PromptArgument {
+                        name: "optional_arg".to_string(),
+                        description: Some("An optional argument".to_string()),
+                        required: Some(false),
+                    },
+                    PromptArgument {
+                        name: "default_arg".to_string(),
+                        description: Some("Argument with default required".to_string()),
+                        required: None, // Should default to false
+                    },
+                ]),
+            },
+        };
+        assert_eq!(bundle_mixed_args.format_arguments_for_display(), "required_arg*, optional_arg, default_arg");
+    }
+
+    #[test]
+    fn test_server_name_truncation() {
+        use super::util::truncate_safe_in_place;
+        
+        // Test that long server names are properly truncated in display
+        let long_server_name = "very-long-server-name-that-exceeds-column-width";
+        assert!(long_server_name.len() > PROMPT_SELECTOR_SERVER_WIDTH);
+        
+        let mut truncated = long_server_name.to_string();
+        truncate_safe_in_place(&mut truncated, PROMPT_SELECTOR_SERVER_WIDTH, TRUNCATED_SUFFIX);
+        
+        assert_eq!(truncated, "very-...");  // Updated for 8-char width
+        assert_eq!(truncated.len(), PROMPT_SELECTOR_SERVER_WIDTH); // Fits in column width
+    }
+
+    #[test]
+    fn test_column_constants() {
+        use super::util::truncate_safe_in_place;
+        
+        // Verify our constants are reasonable values
+        assert_eq!(PROMPT_SELECTOR_SERVER_WIDTH, 8);
+        assert_eq!(PROMPT_SELECTOR_PROMPT_WIDTH, 18);
+        assert_eq!(PROMPT_SELECTOR_DESC_WIDTH, 25);
+        // Arguments column has no fixed width - uses remaining space
+        
+        // Verify truncation logic uses constants correctly
+        let long_desc = "a".repeat(PROMPT_SELECTOR_DESC_WIDTH + 10);
+        let mut truncated_desc = long_desc.clone();
+        truncate_safe_in_place(&mut truncated_desc, PROMPT_SELECTOR_DESC_WIDTH, TRUNCATED_SUFFIX);
+        assert_eq!(truncated_desc.len(), PROMPT_SELECTOR_DESC_WIDTH);
+    }
+
+    #[test]
+    fn test_prompt_selector_new() {
+        use tokio::sync::broadcast;
+        use super::super::tool_manager::{PromptQuery, PromptQueryResult};
+
+        let (sender, _) = broadcast::channel::<PromptQuery>(5);
+        let (_, receiver) = broadcast::channel::<PromptQueryResult>(5);
+        
+        let selector = PromptSelector::new(sender, receiver);
+        
+        // Test that the selector was created successfully
+        // We can't easily test the internal state, but we can verify it doesn't panic
+        assert!(true); // If we get here, the constructor worked
     }
 }

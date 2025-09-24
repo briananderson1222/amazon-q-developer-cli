@@ -472,6 +472,29 @@ pub struct PromptBundle {
     pub prompt_get: Prompt,
 }
 
+impl PromptBundle {
+    /// Format prompt arguments for display
+    pub fn format_arguments_for_display(&self) -> String {
+        if let Some(args) = &self.prompt_get.arguments {
+            if args.is_empty() {
+                return String::new();
+            }
+            
+            let mut arg_parts = Vec::new();
+            for arg in args {
+                if arg.required.unwrap_or(false) {
+                    arg_parts.push(format!("{}*", arg.name));
+                } else {
+                    arg_parts.push(arg.name.clone());
+                }
+            }
+            arg_parts.join(", ")
+        } else {
+            String::new()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum PromptQuery {
     List,

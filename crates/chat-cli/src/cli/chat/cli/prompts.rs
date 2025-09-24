@@ -182,20 +182,16 @@ impl PromptsArgs {
                         }
                     })
                 )?;
-                if let Some(args) = bundle.prompt_get.arguments.as_ref() {
-                    for (i, arg) in args.iter().enumerate() {
-                        queue!(
-                            session.stderr,
-                            style::SetForegroundColor(Color::DarkGrey),
-                            style::Print(match arg.required {
-                                Some(true) => format!("{}*", arg.name),
-                                _ => arg.name.clone(),
-                            }),
-                            style::SetForegroundColor(Color::Reset),
-                            style::Print(if i < args.len() - 1 { ", " } else { "\n" }),
-                        )?;
-                    }
+                let formatted_args = bundle.format_arguments_for_display();
+                if !formatted_args.is_empty() {
+                    queue!(
+                        session.stderr,
+                        style::SetForegroundColor(Color::DarkGrey),
+                        style::Print(formatted_args),
+                        style::SetForegroundColor(Color::Reset),
+                    )?;
                 }
+                queue!(session.stderr, style::Print("\n"))?;
             }
         }
 

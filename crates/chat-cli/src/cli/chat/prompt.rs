@@ -178,30 +178,8 @@ impl PromptCompleter {
         // We only want stuff from the current tail end onward
         let mut new_receiver = receiver.resubscribe();
 
-        // Here we poll on the receiver for [max_attempts] number of times.
-        // The reason for this is because we are trying to receive something managed by an async
-        // channel from a sync context.
-        // If we ever switch back to a single threaded runtime for whatever reason, this function
-        // will not panic but nothing will be fetched because the thread that is doing
-        // try_recv is also the thread that is supposed to be doing the sending.
-        let mut attempts = 0;
-        let max_attempts = 5;
-        let query_res = loop {
-            match new_receiver.try_recv() {
-                Ok(result) => break result,
-                Err(_e) if attempts < max_attempts - 1 => {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                },
-                Err(e) => {
-                    return Err(ReadlineError::Io(std::io::Error::other(eyre::eyre!(
-                        "Failed to receive prompt info from complete prompt after {} attempts: {:?}",
-                        max_attempts,
-                        e
-                    ))));
-                },
-            }
-        };
+        // Use shared polling logic
+        let query_res = Self::poll_for_query_result(&mut new_receiver)?;
         let matches = match query_res {
             PromptQueryResult::Search(list) => list.into_iter().map(|n| format!("@{n}")).collect::<Vec<_>>(),
             PromptQueryResult::List(_) => {
@@ -212,6 +190,34 @@ impl PromptCompleter {
         };
 
         Ok(matches)
+    }
+
+    pub fn get_channels(&self) -> (PromptQuerySender, PromptQueryResponseReceiver) {
+        (self.sender.clone(), self.receiver.borrow().resubscribe())
+    }
+
+    /// Shared polling logic for prompt queries - used by both Tab completion and prompt selection
+    pub fn poll_for_query_result(
+        receiver: &mut PromptQueryResponseReceiver
+    ) -> Result<PromptQueryResult, ReadlineError> {
+        let mut attempts = 0;
+        let max_attempts = 5;
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => return Ok(result),
+                Err(_e) if attempts < max_attempts - 1 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                },
+                Err(e) => {
+                    return Err(ReadlineError::Io(std::io::Error::other(eyre::eyre!(
+                        "Failed to receive prompt info after {} attempts: {:?}",
+                        max_attempts,
+                        e
+                    ))));
+                },
+            }
+        }
     }
 }
 
@@ -373,6 +379,10 @@ pub struct ChatHelper {
 impl ChatHelper {
     pub fn get_history_path(&self) -> PathBuf {
         self.hinter.get_history_path()
+    }
+
+    pub fn get_prompt_channels(&self) -> (PromptQuerySender, PromptQueryResponseReceiver) {
+        self.completer.prompt_completer.get_channels()
     }
 }
 

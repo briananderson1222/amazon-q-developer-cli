@@ -88,6 +88,32 @@ impl InputSource {
         }
     }
 
+    #[cfg(unix)]
+    pub fn put_skim_prompt_selector(&mut self, os: &Os) {
+        use rustyline::{
+            EventHandler,
+            KeyEvent,
+        };
+
+        use crate::database::settings::Setting;
+
+        if let inner::Inner::Readline(rl) = &mut self.0 {
+            let key_char = match os.database.settings.get_string(Setting::SkimPromptKey) {
+                Some(key) if key.len() == 1 => key.chars().next().unwrap_or('v'),
+                _ => 'v', // Default to 'v' if setting is missing or invalid
+            };
+            // Get the channels from the existing helper (same channels as Tab completion uses)
+            if let Some(helper) = rl.helper() {
+                let (sender, receiver) = helper.get_prompt_channels();
+                
+                rl.bind_sequence(
+                    KeyEvent::ctrl(key_char),
+                    EventHandler::Conditional(Box::new(super::skim_integration::PromptSelector::new(sender, receiver))),
+                );
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn new_mock(lines: Vec<String>) -> Self {
         Self(inner::Inner::Mock { index: 0, lines })
